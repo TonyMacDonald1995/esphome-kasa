@@ -5,10 +5,10 @@ from esphome.const import CONF_ID
 
 from . import kasa_plug_ns
 
-# This component talks TCP to the plug, so it needs the network stack up. The
-# socket abstraction and json parser are pulled in automatically.
+# This component talks TCP to the plug (via Arduino's WiFiClient), so it needs
+# the network stack up. The json parser is pulled in automatically.
 DEPENDENCIES = ["network"]
-AUTO_LOAD = ["socket", "json"]
+AUTO_LOAD = ["json"]
 
 CONF_HOST = "host"
 CONF_PORT = "port"

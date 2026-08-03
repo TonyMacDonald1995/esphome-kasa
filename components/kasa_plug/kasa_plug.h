@@ -1,11 +1,9 @@
 #pragma once
 
-#include <memory>
 #include <string>
 
 #include "esphome/core/component.h"
 #include "esphome/components/switch/switch.h"
-#include "esphome/components/socket/socket.h"
 
 namespace esphome {
 namespace kasa_plug {

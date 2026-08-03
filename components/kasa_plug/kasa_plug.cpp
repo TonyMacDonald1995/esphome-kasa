@@ -1,10 +1,12 @@
 #include "kasa_plug.h"
 
-#include <cerrno>
-
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
 #include "esphome/components/json/json_util.h"
+
+#ifdef USE_ARDUINO
+#include <WiFiClient.h>
+#endif
 
 namespace esphome {
 namespace kasa_plug {
@@ -75,54 +77,29 @@ void KasaPlugSwitch::write_state(bool state) {
 }
 
 bool KasaPlugSwitch::request_(const std::string &payload, std::string *response) {
-  std::unique_ptr<socket::Socket> sock = socket::socket_ip(SOCK_STREAM, IPPROTO_TCP);
-  if (sock == nullptr) {
-    ESP_LOGW(TAG, "Failed to create socket");
-    return false;
-  }
-  sock->setblocking(false);
-
-  struct sockaddr_storage addr {};
-  socklen_t addr_len = socket::set_sockaddr((struct sockaddr *) &addr, sizeof(addr), this->host_, this->port_);
-  if (addr_len == 0) {
-    ESP_LOGW(TAG, "Invalid host '%s'", this->host_.c_str());
+  // ESPHome's socket abstraction can't open outbound TCP connections on the
+  // raw-LWIP platforms (ESP8266 / RP2040-picow), so we use Arduino's WiFiClient
+  // for the client side. It works the same on ESP32-Arduino.
+  WiFiClient client;
+  client.setTimeout(CONNECT_TIMEOUT_MS);
+  if (!client.connect(this->host_.c_str(), this->port_)) {
+    ESP_LOGW(TAG, "Connecting to %s:%u failed", this->host_.c_str(), this->port_);
     return false;
   }
 
-  int err = sock->connect((struct sockaddr *) &addr, addr_len);
-  if (err != 0 && errno != EINPROGRESS) {
-    ESP_LOGW(TAG, "Connecting to %s:%u failed: errno %d", this->host_.c_str(), this->port_, errno);
-    sock->close();
-    return false;
-  }
-
-  // Send the framed request. A non-blocking write before the connection has
-  // completed returns EAGAIN/ENOTCONN, so we spin (bounded) until it goes out.
+  // Send the framed request.
   const std::string frame = encrypt_(payload);
-  uint32_t start = millis();
-  size_t sent = 0;
-  while (sent < frame.size()) {
-    ssize_t written = sock->write(frame.data() + sent, frame.size() - sent);
-    if (written > 0) {
-      sent += written;
-    } else if (written < 0 &&
-               (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN || errno == EINPROGRESS)) {
-      if (millis() - start > CONNECT_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "Timed out sending to %s:%u", this->host_.c_str(), this->port_);
-        sock->close();
-        return false;
-      }
-      delay(2);
-    } else {
-      ESP_LOGW(TAG, "Sending to %s:%u failed: errno %d", this->host_.c_str(), this->port_, errno);
-      sock->close();
-      return false;
-    }
+  size_t written = client.write(reinterpret_cast<const uint8_t *>(frame.data()), frame.size());
+  if (written != frame.size()) {
+    ESP_LOGW(TAG, "Sending to %s:%u failed (%u/%u bytes)", this->host_.c_str(), this->port_, (unsigned) written,
+             (unsigned) frame.size());
+    client.stop();
+    return false;
   }
 
   // A command that we don't need the reply for (set_relay_state) is done.
   if (response == nullptr) {
-    sock->close();
+    client.stop();
     return true;
   }
 
@@ -132,36 +109,35 @@ bool KasaPlugSwitch::request_(const std::string &payload, std::string *response)
   std::string raw;
   uint32_t need = 0;
   bool have_header = false;
-  start = millis();
-  char buf[512];
+  uint32_t start = millis();
+  uint8_t buf[512];
   while (true) {
-    ssize_t rd = sock->read(buf, sizeof(buf));
-    if (rd > 0) {
-      raw.append(buf, rd);
-      if (!have_header && raw.size() >= 4) {
-        need = (static_cast<uint8_t>(raw[0]) << 24) | (static_cast<uint8_t>(raw[1]) << 16) |
-               (static_cast<uint8_t>(raw[2]) << 8) | static_cast<uint8_t>(raw[3]);
-        have_header = true;
+    int avail = client.available();
+    if (avail > 0) {
+      int rd = client.read(buf, sizeof(buf));
+      if (rd > 0) {
+        raw.append(reinterpret_cast<char *>(buf), rd);
+        if (!have_header && raw.size() >= 4) {
+          need = (static_cast<uint8_t>(raw[0]) << 24) | (static_cast<uint8_t>(raw[1]) << 16) |
+                 (static_cast<uint8_t>(raw[2]) << 8) | static_cast<uint8_t>(raw[3]);
+          have_header = true;
+        }
+        if (have_header && raw.size() >= need + 4) {
+          break;
+        }
+        continue;
       }
-      if (have_header && raw.size() >= need + 4) {
-        break;
-      }
-    } else if (rd == 0) {
-      // Peer closed the connection.
+    } else if (!client.connected()) {
+      // Peer closed the connection and the receive buffer is drained.
       break;
-    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      if (millis() - start > READ_TIMEOUT_MS) {
-        ESP_LOGW(TAG, "Timed out reading from %s:%u", this->host_.c_str(), this->port_);
-        break;
-      }
-      delay(2);
-    } else {
-      ESP_LOGW(TAG, "Reading from %s:%u failed: errno %d", this->host_.c_str(), this->port_, errno);
-      sock->close();
-      return false;
     }
+    if (millis() - start > READ_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "Timed out reading from %s:%u", this->host_.c_str(), this->port_);
+      break;
+    }
+    delay(2);
   }
-  sock->close();
+  client.stop();
 
   if (raw.size() <= 4) {
     ESP_LOGW(TAG, "Empty response from %s:%u", this->host_.c_str(), this->port_);
