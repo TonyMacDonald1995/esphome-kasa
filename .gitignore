@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# ESPHome / PlatformIO build artifacts
+.esphome/
+.pioenvs/
+.piolibdeps/
+secrets.yaml
