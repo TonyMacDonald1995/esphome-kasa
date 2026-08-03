@@ -1,0 +1,46 @@
+# Example ESPHome configuration using the kasa_plug external component.
+#
+# This runs on an ESP board (ESP32/ESP8266) and controls one or more TP-Link
+# Kasa smart plugs elsewhere on your LAN over their local protocol -- no cloud,
+# no TP-Link account required.
+#
+# Compile/flash with:  esphome run example.yaml
+
+esphome:
+  name: kasa-bridge
+
+esp32:
+  board: esp32dev
+
+logger:
+api:
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Pull the component straight from this repository. While developing you can
+# instead point `source` at a local path (see below).
+external_components:
+  - source: github://tonymacdonald1995/esphome-kasa
+    components: [kasa_plug]
+    refresh: 1d
+  # Local development alternative:
+  # - source:
+  #     type: local
+  #     path: components
+  #   components: [kasa_plug]
+
+switch:
+  - platform: kasa_plug
+    name: "Living Room Plug"
+    host: 192.168.1.42
+    # Optional, defaults shown:
+    # port: 9999
+    # update_interval: 30s
+
+  - platform: kasa_plug
+    name: "Coffee Maker"
+    host: 192.168.1.43
