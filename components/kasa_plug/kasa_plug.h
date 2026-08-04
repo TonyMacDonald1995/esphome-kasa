@@ -45,6 +45,8 @@ class KasaPlugSwitch : public switch_::Switch, public PollingComponent {
   // switch_::Switch
   void write_state(bool state) override;
 
+  /// Create a fresh AsyncClient and attach the receive callbacks.
+  void create_client_();
   /// Begin a connect/send/receive round trip. Only valid when idle.
   void start_transaction_(Transaction type);
   /// Close the connection, update the warning status, and start the next
@@ -59,6 +61,13 @@ class KasaPlugSwitch : public switch_::Switch, public PollingComponent {
   /// Reverse encrypt_. Skips the 4-byte length header before decoding.
   static std::string decrypt_(const std::string &data);
 
+  /// One client per transaction: created by start_transaction_(), destroyed by
+  /// finish_transaction_(). Reusing one AsyncClient across connections is not
+  /// safe on every platform: RPAsyncTCP's close() only *defers* the close, so
+  /// a reused client still holds the previous pcb and refuses the next
+  /// connect() (and closing again can touch a pcb lwIP already freed). The
+  /// destructor is the one cleanup path all the AsyncTCP libraries implement
+  /// as an immediate, callback-clearing close.
   std::unique_ptr<AsyncClient> client_;
 
   /// Guards rx_buf_ and the flags below: the AsyncTCP libraries invoke their
@@ -76,6 +85,8 @@ class KasaPlugSwitch : public switch_::Switch, public PollingComponent {
   size_t tx_offset_{0};
   std::string host_;
   uint32_t transaction_start_{0};
+  /// Last time loop() emitted the in-flight progress heartbeat.
+  uint32_t last_progress_log_{0};
   Transaction transaction_{Transaction::NONE};
   /// Latest state requested via write_state(); consumed when its transaction
   /// starts, so a toggle during an in-flight transaction is sent right after.

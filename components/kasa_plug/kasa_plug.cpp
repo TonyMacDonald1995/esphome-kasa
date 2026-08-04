@@ -27,6 +27,13 @@ static const uint32_t TRANSACTION_TIMEOUT_MS = 2000;
 static const size_t MAX_RESPONSE_SIZE = 8192;
 
 void KasaPlugSwitch::setup() {
+  // The client is created per transaction (see client_); nothing to run until
+  // the first one starts.
+  this->disable_loop();
+  ESP_LOGD(TAG, "'%s': setup complete", this->host_.c_str());
+}
+
+void KasaPlugSwitch::create_client_() {
   this->client_ = std::make_unique<AsyncClient>();
 
   // The callbacks may run outside the main loop (see lock_), so they only
@@ -56,9 +63,6 @@ void KasaPlugSwitch::setup() {
         self->rx_disconnected_ = true;
       },
       this);
-
-  // Nothing to run until the first transaction starts.
-  this->disable_loop();
 }
 
 void KasaPlugSwitch::dump_config() {
@@ -71,7 +75,8 @@ void KasaPlugSwitch::dump_config() {
 
 void KasaPlugSwitch::update() {
   if (this->transaction_ != Transaction::NONE) {
-    ESP_LOGV(TAG, "'%s': transaction still in flight, skipping poll", this->host_.c_str());
+    // At DEBUG on purpose: repeated occurrences mean a transaction is stuck.
+    ESP_LOGD(TAG, "'%s': transaction still in flight, skipping poll", this->host_.c_str());
     return;
   }
   if (!network::is_connected()) {
@@ -91,25 +96,27 @@ void KasaPlugSwitch::write_state(bool state) {
 }
 
 void KasaPlugSwitch::loop() {
+  if (this->transaction_ == Transaction::NONE || this->client_ == nullptr) {
+    this->disable_loop();
+    return;
+  }
+
 #if !defined(USE_ESP32) && !defined(USE_ESP8266) && !defined(USE_RP2040) && !defined(USE_LIBRETINY)
   // The socket-based AsyncClient (host and other non-AsyncTCP platforms) is
   // driven from the main loop; the AsyncTCP libraries drive themselves.
   this->client_->loop();
 #endif
 
-  if (this->transaction_ == Transaction::NONE) {
-    this->disable_loop();
-    return;
-  }
-
   bool error = false;
   bool disconnected = false;
   bool complete = false;
+  size_t rx_size = 0;
   std::string frame;
   {
     LockGuard guard(this->lock_);
     error = this->rx_error_;
     disconnected = this->rx_disconnected_;
+    rx_size = this->rx_buf_.size();
     if (this->rx_buf_.size() >= 4) {
       uint32_t need = (static_cast<uint8_t>(this->rx_buf_[0]) << 24) |
                       (static_cast<uint8_t>(this->rx_buf_[1]) << 16) |
@@ -147,6 +154,21 @@ void KasaPlugSwitch::loop() {
   if (this->tx_offset_ < this->tx_frame_.size() && this->client_->connected()) {
     this->tx_offset_ +=
         this->client_->write(this->tx_frame_.data() + this->tx_offset_, this->tx_frame_.size() - this->tx_offset_);
+    if (this->tx_offset_ >= this->tx_frame_.size()) {
+      ESP_LOGD(TAG, "'%s': request sent (%u bytes), waiting for reply", this->host_.c_str(),
+               (unsigned) this->tx_frame_.size());
+    }
+  }
+
+  // Progress heartbeat while a transaction is in flight: if the device stalls,
+  // the last line of this tells us in which phase (connecting / sending /
+  // waiting for data) it happened.
+  uint32_t now = millis();
+  if (now - this->last_progress_log_ >= 500) {
+    this->last_progress_log_ = now;
+    ESP_LOGD(TAG, "'%s': in flight: connected=%d sent=%u/%u rx=%u elapsed=%ums", this->host_.c_str(),
+             (int) this->client_->connected(), (unsigned) this->tx_offset_, (unsigned) this->tx_frame_.size(),
+             (unsigned) rx_size, (unsigned) (now - this->transaction_start_));
   }
 }
 
@@ -154,6 +176,10 @@ void KasaPlugSwitch::start_transaction_(Transaction type) {
   {
     LockGuard guard(this->lock_);
     this->rx_buf_.clear();
+    // Typical get_sysinfo replies are 1-2 KB; reserving up front keeps the
+    // append in onData from allocating. On RP2040 the AsyncTCP callbacks can
+    // run from the lwIP async context, where heap churn is best avoided.
+    this->rx_buf_.reserve(2048);
     this->rx_error_ = false;
     this->rx_disconnected_ = false;
   }
@@ -171,16 +197,26 @@ void KasaPlugSwitch::start_transaction_(Transaction type) {
   this->tx_offset_ = 0;
   this->transaction_ = type;
   this->transaction_start_ = millis();
+  this->last_progress_log_ = this->transaction_start_;
   this->enable_loop();
+  this->create_client_();
 
-  if (!this->client_->connect(this->host_.c_str(), this->port_)) {
+  ESP_LOGD(TAG, "'%s': starting %s transaction, connecting to port %u", this->host_.c_str(),
+           type == Transaction::SET_STATE ? "set_relay_state" : "get_sysinfo", this->port_);
+  bool started = this->client_->connect(this->host_.c_str(), this->port_);
+  ESP_LOGD(TAG, "'%s': connect() %s", this->host_.c_str(), started ? "dispatched" : "refused");
+  if (!started) {
     ESP_LOGW(TAG, "'%s': starting connection failed", this->host_.c_str());
     this->finish_transaction_(false);
   }
 }
 
 void KasaPlugSwitch::finish_transaction_(bool success) {
-  this->client_->close();
+  ESP_LOGD(TAG, "'%s': transaction %s after %ums", this->host_.c_str(), success ? "succeeded" : "failed",
+           (unsigned) (millis() - this->transaction_start_));
+  // Destroy the client rather than close() it: the destructor is an immediate
+  // close on every platform, while e.g. RPAsyncTCP's close() merely defers.
+  this->client_.reset();
   this->transaction_ = Transaction::NONE;
   if (success) {
     this->status_clear_warning();
@@ -197,7 +233,10 @@ void KasaPlugSwitch::finish_transaction_(bool success) {
 }
 
 void KasaPlugSwitch::process_response_(const std::string &raw) {
+  ESP_LOGD(TAG, "'%s': response complete (%u bytes) after %ums", this->host_.c_str(), (unsigned) raw.size(),
+           (unsigned) (millis() - this->transaction_start_));
   const std::string response = decrypt_(raw);
+  ESP_LOGV(TAG, "'%s': response: %s", this->host_.c_str(), response.c_str());
   bool ok;
 
   if (this->transaction_ == Transaction::SET_STATE) {
