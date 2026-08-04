@@ -1,17 +1,17 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import switch
-from esphome.const import CONF_ID
+from esphome.const import CONF_PORT
 
 from . import kasa_plug_ns
 
-# This component talks TCP to the plug (via Arduino's WiFiClient), so it needs
-# the network stack up. The json parser is pulled in automatically.
-DEPENDENCIES = ["network"]
-AUTO_LOAD = ["json"]
-
 CONF_HOST = "host"
-CONF_PORT = "port"
+
+# async_tcp provides the cross-platform AsyncClient used for the outbound TCP
+# connection (AsyncTCP libraries on ESP32/ESP8266/RP2040/LibreTiny, a
+# socket-based implementation elsewhere). json parses the plug's replies.
+DEPENDENCIES = ["network"]
+AUTO_LOAD = ["async_tcp", "json"]
 
 KasaPlugSwitch = kasa_plug_ns.class_(
     "KasaPlugSwitch", switch.Switch, cg.PollingComponent

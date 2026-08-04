@@ -20,8 +20,9 @@ obfuscated with an XOR-autokey cipher (initial key `0xAB`) and framed with a
 - sends `set_relay_state` commands when the switch is toggled from
   ESPHome/Home Assistant.
 
-All network I/O is non-blocking with short timeouts, so an unreachable plug logs
-a warning and retries on the next poll rather than stalling the device.
+All network I/O runs through ESPHome's cross-platform `async_tcp` client, fully
+event-driven with a per-request deadline, so an unreachable plug logs a warning
+and retries on the next poll rather than stalling the device.
 
 ## Usage
 
@@ -53,7 +54,8 @@ See [`example.yaml`](example.yaml) for a complete, flashable configuration.
 
 ## Compatibility
 
-- **ESP boards:** ESP32 and ESP8266 (uses ESPHome's cross-platform socket layer).
+- **ESP boards:** ESP32 (Arduino and ESP-IDF), ESP8266, RP2040 and LibreTiny —
+  anything ESPHome's `async_tcp` component supports.
 - **Plugs:** the classic local-protocol Kasa devices (model prefixes `HS`, `KP`,
   `EP`). Newer firmware that only speaks the encrypted **KLAP** protocol over
   HTTP is **not** supported.
